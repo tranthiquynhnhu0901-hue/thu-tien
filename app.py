@@ -35,7 +35,7 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "6.1.3-email-diagnostics"
+APP_VERSION = "6.1.4-unicode-pdf-fix"
 DB_PATH = os.environ.get("TRO_VIET_DB", "tro_viet.sqlite3")
 CATEGORIES = {"Tiêu chuẩn": 2_000_000, "Tiện nghi": 3_200_000,
               "Cao cấp": 4_500_000, "Full nội thất": 8_000_000}
@@ -528,20 +528,42 @@ def report_metrics(period: str, db_path: str=DB_PATH):
 # --------------------------------------------------------------
 
 def _pdf_font() -> str:
+    """Register a Unicode TTF; work on cloud images without OS fonts.
+
+    matplotlib (declared in requirements.txt) includes DejaVu Sans; no
+    system package installation or font file committed to GitHub is needed.
+    """
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
+
+    if "VietSans" in pdfmetrics.getRegisteredFontNames():
+        return "VietSans"
+    root = Path(__file__).resolve().parent
     paths = [
+        root / "assets" / "DejaVuSans.ttf",  # legacy install, if present
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         Path("/usr/local/share/fonts/DejaVuSans.ttf"),
         Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
-        Path("assets/DejaVuSans.ttf"),
     ]
+    try:
+        # Reliable fallback on Streamlit Community Cloud, where OS fonts
+        # are not guaranteed to exist.
+        from matplotlib import get_data_path
+        paths.append(Path(get_data_path()) / "fonts" / "ttf" / "DejaVuSans.ttf")
+    except ImportError:
+        pass
     for path in paths:
-        if path.exists():
-            if "VietSans" not in pdfmetrics.getRegisteredFontNames():
-                pdfmetrics.registerFont(TTFont("VietSans",str(path)))
-            return "VietSans"
-    raise RuntimeError("Không tìm thấy font Unicode để xuất PDF tiếng Việt. Cài DejaVu Sans trên máy chủ.")
+        if path.is_file():
+            try:
+                pdfmetrics.registerFont(TTFont("VietSans", str(path)))
+                return "VietSans"
+            except Exception:
+                continue
+    raise RuntimeError(
+        "Chưa tìm thấy font Unicode để tạo PDF. "
+        "Hãy cập nhật cả app.py và requirements.txt (bổ sung matplotlib), "
+        "rồi khởi động lại ứng dụng Streamlit."
+    )
 
 
 def _pdf_doc(title: str, subtitle: str, sections: list[tuple[str,list[list[str]]]],
@@ -1221,6 +1243,28 @@ def screen_billing(st,period,db_path):
             if int(selected_inv["amount"]) > 100_000_000:
                 st.error("Chứng từ này có khoản phát sinh trên 100 triệu đồng. "
                          "Hãy kiểm tra lại tiền phòng, điện, nước, phụ phí trước khi gửi cho khách.")
+            with st.expander("Xem chi tiết các khoản tiền để kiểm tra sai lệch",
+                             expanded=int(selected_inv["amount"]) > 100_000_000):
+                snap=selected_inv["snapshot"]
+                checks=[
+                    ("Tiền thuê", snap.get("rent_amount",0)),
+                    ("Tiền điện", snap.get("electric_amount",0)),
+                    ("Tiền nước", snap.get("water_amount",0)),
+                    ("Phụ phí", snap.get("fee_amount",0)),
+                    ("Giảm trừ", -int(snap.get("discount_amount",0) or 0)),
+                    ("Phát sinh đã chốt", selected_inv["amount"]),
+                    ("Nợ cũ khi phát hành", selected_inv["prior_balance"]),
+                    ("Trả trước được phân bổ", -int(selected_inv["credit_used"])),
+                    ("Tổng tại thời điểm phát hành", int(selected_inv["amount"]) +
+                     int(selected_inv["prior_balance"]) - int(selected_inv["credit_used"])),
+                ]
+                st.dataframe(pd.DataFrame([{"Khoản tiền":k, "Số tiền (VNĐ)":money(v)}
+                                           for k,v in checks]), hide_index=True,
+                             use_container_width=True)
+                st.caption(f'Số điện: {snap.get("e_start", "-")} → {snap.get("e_end", "-")}; '
+                           f'Số nước: {snap.get("w_start", "-")} → {snap.get("w_end", "-")}. '
+                           "Thông báo đã chốt giữ nguyên số liệu gốc; nếu có sai, cần điều chỉnh "
+                           "chứng từ theo quy trình có lưu lịch sử, không chỉ sửa thông tin phòng.")
             z1,z2=st.columns(2)
             try:
                 with z1: _file_dl(st,"Tải PDF thông báo",invoice_pdf(selected_inv),
