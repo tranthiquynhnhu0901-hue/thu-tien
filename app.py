@@ -525,20 +525,44 @@ def report_metrics(period: str, db_path: str=DB_PATH):
 # --------------------------------------------------------------
 
 def _pdf_font() -> str:
+    """Get a real Vietnamese-capable TTF; include a pip-managed fallback for cloud hosts.
+
+    Matplotlib ships DejaVu Sans in its wheel, so Streamlit Community Cloud does
+    not need operating-system fonts to render Vietnamese PDF notices/receipts.
+    """
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
+
+    if "VietSans" in pdfmetrics.getRegisteredFontNames():
+        return "VietSans"
+
     paths = [
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         Path("/usr/local/share/fonts/DejaVuSans.ttf"),
         Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
         Path("assets/DejaVuSans.ttf"),
     ]
+    try:
+        from matplotlib import get_data_path
+        paths.append(Path(get_data_path()) / "fonts" / "ttf" / "DejaVuSans.ttf")
+    except ImportError:
+        pass
+
+    errors = []
     for path in paths:
-        if path.exists():
-            if "VietSans" not in pdfmetrics.getRegisteredFontNames():
-                pdfmetrics.registerFont(TTFont("VietSans",str(path)))
+        if not path.is_file():
+            continue
+        try:
+            pdfmetrics.registerFont(TTFont("VietSans", str(path)))
             return "VietSans"
-    raise RuntimeError("Không tìm thấy font Unicode để xuất PDF tiếng Việt. Cài DejaVu Sans trên máy chủ.")
+        except Exception as exc:
+            errors.append(f"{path.name}: {type(exc).__name__}")
+
+    raise RuntimeError(
+        "Không thể nạp font tiếng Việt để tạo PDF. "
+        "Hãy thêm matplotlib>=3.8,<4.0 vào requirements.txt rồi khởi động lại ứng dụng. "
+        + ("; ".join(errors) if errors else "")
+    )
 
 
 def _pdf_doc(title: str, subtitle: str, sections: list[tuple[str,list[list[str]]]],
@@ -760,6 +784,9 @@ def smtp_config(secrets: dict[str,Any]|None=None) -> dict[str,str]:
     values={}
     for name in ["SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASSWORD","SMTP_FROM"]:
         values[name]=str((secrets or {}).get(name) or os.environ.get(name) or "").strip()
+    # Google's 16-character app password may be displayed in groups separated by spaces.
+    if values["SMTP_HOST"].lower() == "smtp.gmail.com":
+        values["SMTP_PASSWORD"] = values["SMTP_PASSWORD"].replace(" ", "")
     return values
 
 
