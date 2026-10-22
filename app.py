@@ -11,6 +11,7 @@ NOT durable cloud storage; see README.md and in-app Cài đặt section.
 """
 from __future__ import annotations
 
+import base64
 import calendar
 import csv
 import hashlib
@@ -20,6 +21,8 @@ import json
 import os
 import re
 import smtplib
+import urllib.error
+import urllib.request
 import sqlite3
 import ssl
 from contextlib import contextmanager
@@ -32,7 +35,7 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "6.1.1-local"
+APP_VERSION = "6.1.3-email-diagnostics"
 DB_PATH = os.environ.get("TRO_VIET_DB", "tro_viet.sqlite3")
 CATEGORIES = {"Tiêu chuẩn": 2_000_000, "Tiện nghi": 3_200_000,
               "Cao cấp": 4_500_000, "Full nội thất": 8_000_000}
@@ -525,44 +528,20 @@ def report_metrics(period: str, db_path: str=DB_PATH):
 # --------------------------------------------------------------
 
 def _pdf_font() -> str:
-    """Get a real Vietnamese-capable TTF; include a pip-managed fallback for cloud hosts.
-
-    Matplotlib ships DejaVu Sans in its wheel, so Streamlit Community Cloud does
-    not need operating-system fonts to render Vietnamese PDF notices/receipts.
-    """
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
-
-    if "VietSans" in pdfmetrics.getRegisteredFontNames():
-        return "VietSans"
-
     paths = [
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         Path("/usr/local/share/fonts/DejaVuSans.ttf"),
         Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
         Path("assets/DejaVuSans.ttf"),
     ]
-    try:
-        from matplotlib import get_data_path
-        paths.append(Path(get_data_path()) / "fonts" / "ttf" / "DejaVuSans.ttf")
-    except ImportError:
-        pass
-
-    errors = []
     for path in paths:
-        if not path.is_file():
-            continue
-        try:
-            pdfmetrics.registerFont(TTFont("VietSans", str(path)))
+        if path.exists():
+            if "VietSans" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont("VietSans",str(path)))
             return "VietSans"
-        except Exception as exc:
-            errors.append(f"{path.name}: {type(exc).__name__}")
-
-    raise RuntimeError(
-        "Không thể nạp font tiếng Việt để tạo PDF. "
-        "Hãy thêm matplotlib>=3.8,<4.0 vào requirements.txt rồi khởi động lại ứng dụng. "
-        + ("; ".join(errors) if errors else "")
-    )
+    raise RuntimeError("Không tìm thấy font Unicode để xuất PDF tiếng Việt. Cài DejaVu Sans trên máy chủ.")
 
 
 def _pdf_doc(title: str, subtitle: str, sections: list[tuple[str,list[list[str]]]],
@@ -780,53 +759,168 @@ def restore_json(blob: bytes, db_path: str=DB_PATH):
         audit(c,"restore_json",{"version":source.get("version"),"tables":len(tables)})
 
 
-def smtp_config(secrets: dict[str,Any]|None=None) -> dict[str,str]:
-    values={}
-    for name in ["SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASSWORD","SMTP_FROM"]:
-        values[name]=str((secrets or {}).get(name) or os.environ.get(name) or "").strip()
-    # Google's 16-character app password may be displayed in groups separated by spaces.
+def smtp_config(secrets: dict[str, Any] | None = None) -> dict[str, str]:
+    """Read server-side mail credentials. Never log or display secret values."""
+    values = {}
+    for name in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM",
+                 "RESEND_API_KEY", "RESEND_FROM"):
+        values[name] = str((secrets or {}).get(name) or os.environ.get(name) or "").strip()
     if values["SMTP_HOST"].lower() == "smtp.gmail.com":
+        # Google's 16-character app password is sometimes copied as four groups.
         values["SMTP_PASSWORD"] = values["SMTP_PASSWORD"].replace(" ", "")
     return values
 
 
-def send_invoice_email(invoice_id: int, smtp: dict[str,str], db_path: str=DB_PATH):
-    inv=invoice_by_id(invoice_id,db_path);s=inv["snapshot"]
-    recipient=s.get("email","").strip()
-    if not email_valid(recipient): raise ValueError("Khách chưa có email hợp lệ tại thời điểm chốt")
-    if not all(smtp.get(k) for k in ("SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASSWORD","SMTP_FROM")):
-        raise ValueError("Email API/SMTP chưa được cấu hình. Hãy tải PDF và gửi thủ công.")
-    sent=query("SELECT id FROM email_events WHERE invoice_id=? AND recipient=? AND status='Đã gửi' LIMIT 1",
-               (invoice_id,recipient),db_path)
-    if sent: raise ValueError("Email đã được gửi cho địa chỉ này. Không gửi trùng tự động.")
-    pdf=invoice_pdf(inv)
-    msg=EmailMessage()
-    msg["Subject"]=f'[TRỌ VIỆT] Thông báo tiền phòng {s["room_code"]} - {period_label(inv["period"])}'
-    msg["From"]=smtp["SMTP_FROM"];msg["To"]=recipient
-    msg.set_content(f'Kính gửi {s["tenant"]},\n\n'
-                    f'Phòng {s["room_code"]} - {period_label(inv["period"])}.\n'
+def email_provider(cfg: dict[str, str]) -> str:
+    """Prefer HTTPS when configured, otherwise use the existing SMTP implementation."""
+    if cfg.get("RESEND_API_KEY") and cfg.get("RESEND_FROM"):
+        return "Resend HTTPS API"
+    if all(cfg.get(k) for k in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")):
+        return "SMTP"
+    return "Chưa kết nối"
+
+
+def smtp_diagnostic(cfg: dict[str, str]) -> str:
+    """Diagnose SMTP in stages without sending mail or revealing credentials."""
+    fields = ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD")
+    if not all(cfg.get(k) for k in fields):
+        return "Thiếu cấu hình SMTP trong Streamlit Secrets."
+    try:
+        port = int(cfg["SMTP_PORT"])
+        if port not in (465, 587):
+            return "Cổng SMTP không hợp lệ; với Gmail nên dùng 465 hoặc 587."
+    except ValueError:
+        return "Cổng SMTP phải là số nguyên."
+    stage = "mở kết nối mạng"
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(cfg["SMTP_HOST"], port, timeout=12,
+                                  context=ssl.create_default_context()) as server:
+                stage = "chào máy chủ SMTP"
+                code, _ = server.ehlo()
+                if code != 250:
+                    raise RuntimeError(f"Máy chủ trả mã {code} khi EHLO")
+                stage = "xác thực Gmail"
+                server.login(cfg["SMTP_USER"], cfg["SMTP_PASSWORD"])
+        else:
+            with smtplib.SMTP(cfg["SMTP_HOST"], port, timeout=12) as server:
+                stage = "chào máy chủ SMTP"
+                code, _ = server.ehlo()
+                if code != 250:
+                    raise RuntimeError(f"Máy chủ trả mã {code} khi EHLO")
+                stage = "bắt tay STARTTLS"
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+                stage = "xác thực Gmail"
+                server.login(cfg["SMTP_USER"], cfg["SMTP_PASSWORD"])
+        return "Kết nối, TLS và xác thực SMTP đều thành công (chưa gửi thử email)."
+    except smtplib.SMTPAuthenticationError:
+        return "Lỗi ở bước xác thực Gmail: kiểm tra tài khoản và mật khẩu ứng dụng."
+    except (smtplib.SMTPServerDisconnected, TimeoutError, ConnectionError, OSError) as exc:
+        return (f"Kết nối thất bại ở bước {stage}: {type(exc).__name__}. "
+                "Có thể do mạng máy chủ, cổng SMTP hoặc Gmail ngắt kết nối; "
+                "cân nhắc chuyển sang dịch vụ Email API qua HTTPS.")
+    except Exception as exc:
+        return f"SMTP thất bại ở bước {stage}: {type(exc).__name__}."
+
+
+def _resend_email_api(msg: EmailMessage, pdf: bytes, recipient: str,
+                      cfg: dict[str, str], idempotency_key: str) -> str:
+    """Send the existing PDF attachment through Resend over HTTPS, not SMTP."""
+    if not cfg.get("RESEND_API_KEY") or not cfg.get("RESEND_FROM"):
+        raise ValueError("Thiếu RESEND_API_KEY hoặc RESEND_FROM")
+    attachment = next(msg.iter_attachments())
+    payload = {
+        "from": cfg["RESEND_FROM"],
+        "to": [recipient],
+        "subject": str(msg["Subject"]),
+        "text": msg.get_body(preferencelist=("plain",)).get_content(),
+        "attachments": [{
+            "filename": attachment.get_filename(),
+            "content": base64.b64encode(pdf).decode("ascii"),
+        }],
+    }
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + cfg["RESEND_API_KEY"],
+            "Content-Type": "application/json",
+            "Idempotency-Key": idempotency_key,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        try:
+            body = json.loads(err.read().decode("utf-8"))
+            reason = str(body.get("message") or "Lỗi nhà cung cấp email")[:220]
+        except Exception:
+            reason = "Không thể xử lý phản hồi"
+        raise RuntimeError(f"Resend từ chối (HTTP {err.code}): {reason}") from None
+    if not response_data.get("id"):
+        raise RuntimeError("Resend không trả mã xác nhận gửi email")
+    return "Resend đã chấp nhận email (mã " + str(response_data["id"]) + "); chưa xác nhận đã tới hộp thư"
+
+
+def send_invoice_email(invoice_id: int, smtp: dict[str, str], db_path: str = DB_PATH):
+    inv = invoice_by_id(invoice_id, db_path)
+    snapshot = inv["snapshot"]
+    recipient = snapshot.get("email", "").strip()
+    if not email_valid(recipient):
+        raise ValueError("Khách chưa có email hợp lệ tại thời điểm chốt")
+    provider = email_provider(smtp)
+    if provider == "Chưa kết nối":
+        raise ValueError("Chưa cấu hình SMTP hoặc Email API. Hãy tải PDF và gửi thủ công.")
+    sent = query("SELECT id FROM email_events WHERE invoice_id=? AND recipient=? AND status='Đã gửi' LIMIT 1",
+                 (invoice_id, recipient), db_path)
+    if sent:
+        raise ValueError("Email đã được gửi cho địa chỉ này. Không gửi trùng tự động.")
+    pdf = invoice_pdf(inv)
+    msg = EmailMessage()
+    msg["Subject"] = f'[TRỌ VIỆT] Thông báo tiền phòng {snapshot["room_code"]} - {period_label(inv["period"])}'
+    msg["From"] = smtp.get("RESEND_FROM") if provider.startswith("Resend") else smtp["SMTP_FROM"]
+    msg["To"] = recipient
+    msg.set_content(f'Kính gửi {snapshot["tenant"]},\n\n'
+                    f'Phòng {snapshot["room_code"]} - {period_label(inv["period"])}.\n'
                     f'Tiền phát sinh kỳ này: {money(inv["amount"])}.\n'
                     f'Công nợ trước kỳ: {money(inv["prior_balance"])}.\n'
                     f'Hạn thanh toán: {inv["due_at"]}.\n'
                     'Vui lòng xem PDF đính kèm và liên hệ chủ trọ nếu có sai lệch.\n\nTrân trọng.')
-    msg.add_attachment(pdf,maintype="application",subtype="pdf",filename=f'Thong_bao_{s["room_code"]}_{inv["period"]}.pdf')
-    status="Đã gửi";message="SMTP đã chấp nhận gửi; chưa xác nhận hộp thư nhận"
+    msg.add_attachment(pdf, maintype="application", subtype="pdf",
+                       filename=f'Thong_bao_{snapshot["room_code"]}_{inv["period"]}.pdf')
+    status = "Đã gửi"
+    message = "SMTP đã chấp nhận gửi; chưa xác nhận hộp thư nhận"
     try:
-        port=int(smtp["SMTP_PORT"])
-        if port==465:
-            with smtplib.SMTP_SSL(smtp["SMTP_HOST"],port,timeout=20,context=ssl.create_default_context()) as server:
-                server.login(smtp["SMTP_USER"],smtp["SMTP_PASSWORD"]);server.send_message(msg)
+        if provider.startswith("Resend"):
+            idem = f'tro-viet-{invoice_id}-{hashlib.sha256(recipient.encode()).hexdigest()[:16]}'
+            message = _resend_email_api(msg, pdf, recipient, smtp, idem)
         else:
-            with smtplib.SMTP(smtp["SMTP_HOST"],port,timeout=20) as server:
-                server.starttls(context=ssl.create_default_context())
-                server.login(smtp["SMTP_USER"],smtp["SMTP_PASSWORD"]);server.send_message(msg)
-    except Exception as e:
-        status="Lỗi gửi";message=f"{type(e).__name__}: {str(e)[:170]}"
-    with db_transaction(db_path) as c:
-        c.execute("INSERT INTO email_events(invoice_id,recipient,status,message,created_at) VALUES(?,?,?,?,?)",
-                  (invoice_id,recipient,status,message,now_iso()))
-        audit(c,"email_attempt",{"invoice_id":invoice_id,"status":status,"recipient":recipient})
-    if status!="Đã gửi": raise RuntimeError(message)
+            port = int(smtp["SMTP_PORT"])
+            if port == 465:
+                with smtplib.SMTP_SSL(smtp["SMTP_HOST"], port, timeout=20,
+                                      context=ssl.create_default_context()) as server:
+                    server.login(smtp["SMTP_USER"], smtp["SMTP_PASSWORD"])
+                    server.send_message(msg)
+            else:
+                with smtplib.SMTP(smtp["SMTP_HOST"], port, timeout=20) as server:
+                    server.ehlo()
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                    server.login(smtp["SMTP_USER"], smtp["SMTP_PASSWORD"])
+                    server.send_message(msg)
+    except Exception as exc:
+        status = "Lỗi gửi"
+        message = f"{type(exc).__name__}: {str(exc)[:170]}"
+    with db_transaction(db_path) as conn:
+        conn.execute("INSERT INTO email_events(invoice_id,recipient,status,message,created_at) VALUES(?,?,?,?,?)",
+                     (invoice_id, recipient, status, message, now_iso()))
+        audit(conn, "email_attempt", {"invoice_id": invoice_id, "status": status,
+                                      "recipient": recipient, "provider": provider})
+    if status != "Đã gửi":
+        raise RuntimeError(message)
     return message
 
 # --------------------------------------------------------------
@@ -1124,6 +1218,9 @@ def screen_billing(st,period,db_path):
                "Còn nợ":i["outstanding"],"Trạng thái":_status(i)} for i in current]),
                hide_index=True,use_container_width=True)
             selected_inv=st.selectbox("Thông báo cần tải / gửi email",current,format_func=_invoice_title)
+            if int(selected_inv["amount"]) > 100_000_000:
+                st.error("Chứng từ này có khoản phát sinh trên 100 triệu đồng. "
+                         "Hãy kiểm tra lại tiền phòng, điện, nước, phụ phí trước khi gửi cho khách.")
             z1,z2=st.columns(2)
             try:
                 with z1: _file_dl(st,"Tải PDF thông báo",invoice_pdf(selected_inv),
@@ -1133,11 +1230,11 @@ def screen_billing(st,period,db_path):
                 if st.button("Gửi PDF đến email khách",key="send_one_email"):
                     try: st.success(send_invoice_email(selected_inv["id"],smtp_config(_secrets()),db_path))
                     except Exception as e: st.error(str(e))
-            if not all(smtp_config(_secrets()).values()):
+            if email_provider(smtp_config(_secrets())) == "Chưa kết nối":
                 address=selected_inv["snapshot"].get("email","")
-                st.info("SMTP chưa cấu hình: tải PDF rồi đính kèm thủ công vào email. Nút gửi trực tiếp chỉ hoạt động khi có SMTP thật.")
+                st.info("Chưa có dịch vụ email: tải PDF rồi đính kèm thủ công vào Gmail.")
                 st.code(f'Đến: {address or "[EMAIL KHÁCH]"}\nChủ đề: Thông báo tiền phòng {selected_inv["snapshot"]["room_code"]} - {period_label(period)}',language="text")
-            with st.expander("Gửi email hàng loạt (chỉ khi có SMTP)"):
+            with st.expander("Gửi email hàng loạt (cần SMTP hoặc Resend API)"):
                 possible=[i for i in current if email_valid(i["snapshot"].get("email",""))]
                 email_all=st.checkbox("Chọn tất cả phòng có email hợp lệ",key="email_all_rooms")
                 selected_invs=possible if email_all else st.multiselect("Chọn thông báo",possible,format_func=_invoice_title)
@@ -1147,7 +1244,7 @@ def screen_billing(st,period,db_path):
                     for inv in selected_invs:
                         try:send_invoice_email(inv["id"],smtp_config(_secrets()),db_path);done.append(inv["snapshot"]["room_code"])
                         except Exception as e:failed.append(inv["snapshot"]["room_code"]+": "+str(e))
-                    st.success(f"SMTP chấp nhận {len(done)} email")
+                    st.success(f"Nhà cung cấp đã chấp nhận {len(done)} email")
                     for error in failed:st.warning(error)
         else:st.info("Chưa có thông báo thu tiền đã chốt.")
     with tabs[1]:
@@ -1275,7 +1372,7 @@ def screen_settings(st,period,db_path):
             holder=st.text_input("Chủ tài khoản",cfg["bank_holder"])
             account=st.text_input("Số tài khoản",cfg["bank_account"])
             due_day=st.number_input("Ngày đến hạn (tháng kế tiếp)",min_value=1,max_value=28,value=int(cfg["due_day"]))
-            auto_email=st.checkbox("Tự gửi email khi chốt tiền (cần SMTP)",value=cfg.get("auto_email")=="1")
+            auto_email=st.checkbox("Tự gửi email khi chốt tiền (cần SMTP hoặc Resend API)",value=cfg.get("auto_email")=="1")
         if st.form_submit_button("Lưu cài đặt",type="primary"):
             try:settings_save({"property_name":name,"property_address":address,"property_phone":phone,
                   "electric_rate":str(e_rate),"water_rate":str(w_rate),"bank_name":bank,
@@ -1296,7 +1393,13 @@ def screen_settings(st,period,db_path):
     st.divider()
     st.markdown("#### Trạng thái tích hợp")
     smtp=smtp_config(_secrets())
-    st.write("**Email SMTP:**", "Đã cấu hình" if all(smtp.values()) else "Chưa kết nối — có thể tải PDF và gửi thủ công")
+    st.write("**Dịch vụ gửi email:**", email_provider(smtp))
+    st.caption("Trạng thái có cấu hình không có nghĩa đã gửi thành công. Hãy thử nghiệm với email của mình.")
+    if st.button("Kiểm tra kết nối SMTP (không gửi email)", key="smtp_check"):
+        st.info(smtp_diagnostic(smtp))
+    st.caption("Nếu SMTP tiếp tục bị ngắt kết nối trên Streamlit Cloud, "
+               "có thể dùng Resend qua HTTPS: thêm RESEND_API_KEY và RESEND_FROM vào Secrets. "
+               "Để gửi khách thật, cần xác minh tên miền tại Resend. Mật khẩu Gmail không dùng cho Resend.")
     st.write("**Supabase / đa tài khoản:** Chưa kết nối")
     st.write("**Google Login:** Chưa kết nối")
     st.write("**Google Sheets:** Chưa kết nối")
