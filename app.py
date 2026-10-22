@@ -35,7 +35,7 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "6.1.4-unicode-pdf-fix"
+APP_VERSION = "6.1.5-resend-permissions-fix"
 DB_PATH = os.environ.get("TRO_VIET_DB", "tro_viet.sqlite3")
 CATEGORIES = {"Tiêu chuẩn": 2_000_000, "Tiện nghi": 3_200_000,
               "Cao cấp": 4_500_000, "Full nội thất": 8_000_000}
@@ -846,6 +846,79 @@ def smtp_diagnostic(cfg: dict[str, str]) -> str:
         return f"SMTP thất bại ở bước {stage}: {type(exc).__name__}."
 
 
+def _resend_sender_is_testing(cfg: dict[str, str]) -> bool:
+    """Whether Resend's own limited onboarding sender is configured."""
+    return "@resend.dev" in cfg.get("RESEND_FROM", "").lower()
+
+
+def _resend_post(payload: dict, cfg: dict[str, str], idem: str) -> str:
+    """Send HTTPS request and keep actionable provider error details (no keys)."""
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + cfg["RESEND_API_KEY"],
+            "Content-Type": "application/json",
+            "Idempotency-Key": idem,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        # Resend normally returns a JSON body with a meaningful 'message'.
+        # Keep that message visible rather than the old generic error text.
+        raw = err.read(8192).decode("utf-8", errors="replace")
+        try:
+            obj = json.loads(raw)
+            detail = obj.get("message") or obj.get("error") or obj.get("name") or ""
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("name") or ""
+            detail = str(detail).strip()[:450]
+        except (ValueError, AttributeError, TypeError):
+            detail = ""
+        if err.code == 403 and _resend_sender_is_testing(cfg):
+            explanation = (
+                "Đang dùng onboarding@resend.dev: Resend chỉ cho phép gửi thử "
+                "đến email của chính tài khoản Resend. Để gửi email tới khách thuê, "
+                "phải xác minh tên miền tại https://resend.com/domains "
+                "và đổi RESEND_FROM sang địa chỉ thuộc tên miền đó."
+            )
+        elif err.code == 403:
+            explanation = (
+                "Resend từ chối quyền gửi. Kiểm tra tên miền người gửi đã được "
+                "xác minh, API Key còn hoạt động và xem Resend > Logs > lỗi 403."
+            )
+        elif err.code == 401:
+            explanation = "Kiểm tra RESEND_API_KEY trong Streamlit Secrets."
+        else:
+            explanation = "Kiểm tra Resend > Logs để biết lý do."
+        if detail:
+            raise RuntimeError(f"Resend HTTP {err.code}: {detail}. {explanation}") from None
+        raise RuntimeError(f"Resend HTTP {err.code}: {explanation}") from None
+    if not isinstance(data, dict) or not data.get("id"):
+        raise RuntimeError("Resend không trả mã xác nhận gửi email")
+    return str(data["id"])
+
+
+def resend_test_email(cfg: dict[str, str], recipient: str) -> str:
+    """Send one harmless test email, never customer details or invoices."""
+    if not cfg.get("RESEND_API_KEY") or not cfg.get("RESEND_FROM"):
+        raise ValueError("Chưa cấu hình RESEND_API_KEY và RESEND_FROM")
+    recipient = recipient.strip()
+    if not email_valid(recipient):
+        raise ValueError("Địa chỉ email kiểm tra không hợp lệ")
+    payload = {
+        "from": cfg["RESEND_FROM"],
+        "to": [recipient],
+        "subject": "[TRỌ VIỆT] Kiểm tra kết nối Resend",
+        "text": "Đây là email kiểm tra Trọ Việt Manager. Không có dữ liệu khách thuê hoặc hóa đơn.",
+    }
+    email_id = _resend_post(payload, cfg, f"tro-viet-test-{uuid4().hex}")
+    return f"Resend đã chấp nhận email thử nghiệm (mã {email_id}). Hãy kiểm tra hộp thư người nhận."
+
+
 def _resend_email_api(msg: EmailMessage, pdf: bytes, recipient: str,
                       cfg: dict[str, str], idempotency_key: str) -> str:
     """Send the existing PDF attachment through Resend over HTTPS, not SMTP."""
@@ -862,34 +935,17 @@ def _resend_email_api(msg: EmailMessage, pdf: bytes, recipient: str,
             "content": base64.b64encode(pdf).decode("ascii"),
         }],
     }
-    req = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": "Bearer " + cfg["RESEND_API_KEY"],
-            "Content-Type": "application/json",
-            "Idempotency-Key": idempotency_key,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as response:
-            response_data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        try:
-            body = json.loads(err.read().decode("utf-8"))
-            reason = str(body.get("message") or "Lỗi nhà cung cấp email")[:220]
-        except Exception:
-            reason = "Không thể xử lý phản hồi"
-        raise RuntimeError(f"Resend từ chối (HTTP {err.code}): {reason}") from None
-    if not response_data.get("id"):
-        raise RuntimeError("Resend không trả mã xác nhận gửi email")
-    return "Resend đã chấp nhận email (mã " + str(response_data["id"]) + "); chưa xác nhận đã tới hộp thư"
+    email_id = _resend_post(payload, cfg, idempotency_key)
+    return "Resend đã chấp nhận email (mã " + email_id + "); chưa xác nhận đã tới hộp thư"
 
 
 def send_invoice_email(invoice_id: int, smtp: dict[str, str], db_path: str = DB_PATH):
     inv = invoice_by_id(invoice_id, db_path)
     snapshot = inv["snapshot"]
+    # Never email known anomalous invoices, including the P001 675-billion example.
+    if int(inv["amount"]) > 100_000_000:
+        raise ValueError("KHÔNG GỬI: chứng từ phát sinh trên 100 triệu đồng. "
+                         "Cần kiểm tra và xử lý chứng từ sai có lưu lịch sử trước.")
     recipient = snapshot.get("email", "").strip()
     if not email_valid(recipient):
         raise ValueError("Khách chưa có email hợp lệ tại thời điểm chốt")
@@ -1441,6 +1497,21 @@ def screen_settings(st,period,db_path):
     st.caption("Trạng thái có cấu hình không có nghĩa đã gửi thành công. Hãy thử nghiệm với email của mình.")
     if st.button("Kiểm tra kết nối SMTP (không gửi email)", key="smtp_check"):
         st.info(smtp_diagnostic(smtp))
+    if email_provider(smtp).startswith("Resend"):
+        if _resend_sender_is_testing(smtp):
+            st.warning("Resend đang ở chế độ THỬ NGHIỆM (onboarding@resend.dev). "
+                       "Chỉ gửi được tới email đăng ký tài khoản Resend. "
+                       "Gửi khách thuê thật cần xác minh tên miền tại resend.com/domains.")
+        st.markdown("**Gửi thử Resend (không chứa thông tin khách thuê)**")
+        resend_to = st.text_input("Email thử nghiệm - nhập email đăng ký tài khoản Resend", 
+                                  key="resend_test_address")
+        if st.button("Gửi email thử nghiệm qua Resend", key="resend_test_send"):
+            try:
+                st.success(resend_test_email(smtp, resend_to))
+            except Exception as ex:
+                st.error(str(ex))
+        st.caption("Tra cứu lỗi chi tiết: Resend > Logs > lọc mã 403. "
+                   "Không đăng ảnh có API Key hoặc nội dung Secrets.")
     st.caption("Nếu SMTP tiếp tục bị ngắt kết nối trên Streamlit Cloud, "
                "có thể dùng Resend qua HTTPS: thêm RESEND_API_KEY và RESEND_FROM vào Secrets. "
                "Để gửi khách thật, cần xác minh tên miền tại Resend. Mật khẩu Gmail không dùng cho Resend.")
