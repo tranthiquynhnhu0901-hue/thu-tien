@@ -1,0 +1,38 @@
+TRO VIET MANAGER - GUI EMAIL PDF MIEN PHI QUA GMAIL
+BAN 6.1.7. KHONG CAN MUA TEN MIEN, RESEND, SMTP, GOOGLE CLOUD OAUTH.
+
+A. CAP NHAT GITHUB
+- Tai app.py trong bo ZIP nay.
+- Mo GitHub repository thu-tien > app.py > Edit > thay noi dung > Commit.
+- requirements.txt GIU NGUYEN nhu ban 6.1.6 (neu dang dung ban 6.1.4/6.1.5 thi co the thay bang requirements.txt trong ZIP).
+- Sao luu JSON da co, KHONG dung chuc nang khoi phuc neu khong can thiet.
+
+B. TAO GOOGLE APPS SCRIPT (CHI MOT LAN)
+1. Dang nhap Gmail ban muon DUNG DE GUI. Mo https://script.google.com/home/projects/create
+2. Xoa code mac dinh, dan TOAN BO noi dung Code.gs trong ZIP. Bam Save.
+3. Tu dropdown chon ham setup > bam Run > Allow/Authorize de cap quyen GUI EMAIL.
+   Vao Execution log > copy dong APPS_SCRIPT_TOKEN = "...". KHONG GUI TOKEN CHO AI.
+4. Bam Deploy > New deployment > chon type Web app.
+   - Execute as: Me (tai khoan Gmail cua ban)
+   - Who has access: Anyone (bat buoc de server Streamlit goi duoc; script da xac thuc bang token bi mat)
+   Bam Deploy. Copy Web app URL ket thuc bang /exec.
+
+C. DAN STREAMLIT SECRETS
+1. Streamlit Community Cloud > ung dung Tro Viet > Settings > Secrets.
+2. GIU HOAC DAT APP_PASSWORD (mat khau quan ly KHAC mat khau Gmail).
+3. Them 2 dong:
+   APPS_SCRIPT_URL = "WEB_APP_URL_VUA_COPY"
+   APPS_SCRIPT_TOKEN = "TOKEN_TU_EXECUTION_LOG"
+4. Save, khoi dong lai app neu can.
+5. Trong app: Cai dat > Trang thai tich hop > Gui email thu mien phi.
+   Thu gui den chinh email cua ban truoc; kiem tra hop thu Den / Spam.
+6. Neu test thanh cong: Thu tien > chon thong bao da chot > Gui PDF den email khach.
+   Chu y PDF duoc gui toi email luu tai thoi diem chot thong bao.
+
+GIOI HAN VA AN TOAN
+- Tai khoan Gmail ca nhan: Google Apps Script co han muc tham khao 100 nguoi nhan/ngay, co the thay doi.
+- Tranh gui trung: app va script deu ghi nhan ma yeu cau da gui.
+- Script URL co the cong khai, NHUNG TOKEN phai bi mat trong Streamlit Secrets. Khong dang Code.gs kem token len GitHub.
+- Script chay voi quyen cua Gmail chu tai khoan, hay bao ve Gmail bang xac minh 2 buoc.
+- Chi gui khi thong tin khach va so tien da duoc kiem tra, co su dong y nhan thong bao.
+- Du lieu SQLite tren Streamlit Community Cloud khong phai noi luu tru ben vung; nen sao luu dinh ky.
