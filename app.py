@@ -23,6 +23,7 @@ import re
 import smtplib
 import urllib.error
 import urllib.request
+import urllib.parse
 import sqlite3
 import ssl
 from contextlib import contextmanager
@@ -35,7 +36,7 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "6.1.5-resend-permissions-fix"
+APP_VERSION = "6.1.6-gmail-api-oauth"
 DB_PATH = os.environ.get("TRO_VIET_DB", "tro_viet.sqlite3")
 CATEGORIES = {"Tiêu chuẩn": 2_000_000, "Tiện nghi": 3_200_000,
               "Cao cấp": 4_500_000, "Full nội thất": 8_000_000}
@@ -785,7 +786,8 @@ def smtp_config(secrets: dict[str, Any] | None = None) -> dict[str, str]:
     """Read server-side mail credentials. Never log or display secret values."""
     values = {}
     for name in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM",
-                 "RESEND_API_KEY", "RESEND_FROM"):
+                 "RESEND_API_KEY", "RESEND_FROM",
+                 "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_SENDER"):
         values[name] = str((secrets or {}).get(name) or os.environ.get(name) or "").strip()
     if values["SMTP_HOST"].lower() == "smtp.gmail.com":
         # Google's 16-character app password is sometimes copied as four groups.
@@ -795,6 +797,9 @@ def smtp_config(secrets: dict[str, Any] | None = None) -> dict[str, str]:
 
 def email_provider(cfg: dict[str, str]) -> str:
     """Prefer HTTPS when configured, otherwise use the existing SMTP implementation."""
+    if all(cfg.get(k) for k in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
+                                 "GMAIL_REFRESH_TOKEN", "GMAIL_SENDER")):
+        return "Gmail API (OAuth 2.0)"
     if cfg.get("RESEND_API_KEY") and cfg.get("RESEND_FROM"):
         return "Resend HTTPS API"
     if all(cfg.get(k) for k in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")):
@@ -939,6 +944,102 @@ def _resend_email_api(msg: EmailMessage, pdf: bytes, recipient: str,
     return "Resend đã chấp nhận email (mã " + email_id + "); chưa xác nhận đã tới hộp thư"
 
 
+GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+
+
+def _gmail_access_token(cfg: dict[str, str]) -> str:
+    """Exchange stored OAuth refresh token for an ephemeral access token via HTTPS.
+
+    Uses Python standard library so no extra package is needed on Streamlit Cloud.
+    """
+    needed = ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "GMAIL_SENDER")
+    if not all(cfg.get(key) for key in needed):
+        raise ValueError("Thiếu một trong 4 biến GMAIL_* trong Streamlit Secrets.")
+    if not email_valid(cfg["GMAIL_SENDER"]):
+        raise ValueError("GMAIL_SENDER không phải địa chỉ email hợp lệ.")
+    body = urllib.parse.urlencode({
+        "client_id": cfg["GMAIL_CLIENT_ID"],
+        "client_secret": cfg["GMAIL_CLIENT_SECRET"],
+        "refresh_token": cfg["GMAIL_REFRESH_TOKEN"],
+        "grant_type": "refresh_token",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        raise RuntimeError(
+            f"Gmail OAuth HTTP {err.code}: Không làm mới được quyền Gmail. "
+            "Kiểm tra Client ID/Secret và Refresh Token. Nếu ứng dụng OAuth đang "
+            "ở chế độ Testing, refresh token có thể hết hạn sau 7 ngày."
+        ) from None
+    except (TimeoutError, OSError, ValueError) as err:
+        raise RuntimeError(f"Không kết nối được Google OAuth ({type(err).__name__}).") from None
+    token = data.get("access_token") if isinstance(data, dict) else None
+    if not token or not isinstance(token, str):
+        raise RuntimeError("Google OAuth không trả access_token hợp lệ.")
+    return token
+
+
+def _gmail_api_send(msg: EmailMessage, cfg: dict[str, str]) -> str:
+    """Send MIME mail (including each tenant's PDF) over Gmail API HTTPS."""
+    sender = cfg.get("GMAIL_SENDER", "")
+    if not email_valid(sender):
+        raise ValueError("GMAIL_SENDER chưa hợp lệ")
+    if msg.get("From"):
+        msg.replace_header("From", sender)
+    else:
+        msg["From"] = sender
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+    access_token = _gmail_access_token(cfg)
+    req = urllib.request.Request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+        data=json.dumps({"raw": raw}).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + access_token,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        explanations = {
+            400: "Nội dung yêu cầu gửi email chưa hợp lệ",
+            401: "Quyền OAuth không hợp lệ hoặc đã bị thu hồi",
+            403: "Gmail từ chối quyền gửi hoặc đã vượt hạn mức",
+            429: "Đã vượt hạn mức gửi Gmail; cần giảm tốc độ gửi",
+        }
+        raise RuntimeError(f"Gmail API HTTP {err.code}: " +
+                           explanations.get(err.code, "Kiểm tra trạng thái API trên Google Cloud")) from None
+    except (TimeoutError, OSError, ValueError) as err:
+        raise RuntimeError("Không xác nhận được kết quả gửi qua Gmail API "
+                           f"({type(err).__name__}). Kiểm tra hộp thư Đã gửi "
+                           "trước khi gửi lại để tránh trùng email.") from None
+    if not isinstance(result, dict) or not result.get("id"):
+        raise RuntimeError("Gmail API chưa trả mã xác nhận email được chấp nhận.")
+    return "Gmail API đã chấp nhận email (mã " + str(result["id"]) + "); chưa xác nhận đã tới hộp thư"
+
+
+def gmail_test_email(cfg: dict[str, str], recipient: str) -> str:
+    """Test one harmless email; never use a tenant invoice for connection tests."""
+    recipient = recipient.strip()
+    if not email_valid(recipient):
+        raise ValueError("Email thử nghiệm không hợp lệ")
+    msg = EmailMessage()
+    msg["From"] = cfg.get("GMAIL_SENDER", "")
+    msg["To"] = recipient
+    msg["Subject"] = "[TRỌ VIỆT] Kiểm tra gửi Gmail API"
+    msg.set_content("Đây là email kiểm tra từ Trọ Việt Manager, không có dữ liệu khách thuê hoặc hóa đơn.")
+    return _gmail_api_send(msg, cfg)
+
+
 def send_invoice_email(invoice_id: int, smtp: dict[str, str], db_path: str = DB_PATH):
     inv = invoice_by_id(invoice_id, db_path)
     snapshot = inv["snapshot"]
@@ -959,7 +1060,12 @@ def send_invoice_email(invoice_id: int, smtp: dict[str, str], db_path: str = DB_
     pdf = invoice_pdf(inv)
     msg = EmailMessage()
     msg["Subject"] = f'[TRỌ VIỆT] Thông báo tiền phòng {snapshot["room_code"]} - {period_label(inv["period"])}'
-    msg["From"] = smtp.get("RESEND_FROM") if provider.startswith("Resend") else smtp["SMTP_FROM"]
+    if provider.startswith("Gmail API"):
+        msg["From"] = smtp["GMAIL_SENDER"]
+    elif provider.startswith("Resend"):
+        msg["From"] = smtp["RESEND_FROM"]
+    else:
+        msg["From"] = smtp["SMTP_FROM"]
     msg["To"] = recipient
     msg.set_content(f'Kính gửi {snapshot["tenant"]},\n\n'
                     f'Phòng {snapshot["room_code"]} - {period_label(inv["period"])}.\n'
@@ -972,7 +1078,9 @@ def send_invoice_email(invoice_id: int, smtp: dict[str, str], db_path: str = DB_
     status = "Đã gửi"
     message = "SMTP đã chấp nhận gửi; chưa xác nhận hộp thư nhận"
     try:
-        if provider.startswith("Resend"):
+        if provider.startswith("Gmail API"):
+            message = _gmail_api_send(msg, smtp)
+        elif provider.startswith("Resend"):
             idem = f'tro-viet-{invoice_id}-{hashlib.sha256(recipient.encode()).hexdigest()[:16]}'
             message = _resend_email_api(msg, pdf, recipient, smtp, idem)
         else:
@@ -1016,6 +1124,10 @@ def _secrets():
 def _guard(st):
     credentials=_secrets()
     password=str(credentials.get("APP_PASSWORD") or os.environ.get("APP_PASSWORD") or "")
+    if not password and email_provider(smtp_config(credentials)).startswith("Gmail API"):
+        st.error("Bạn đã kết nối Gmail API nhưng chưa thiết lập APP_PASSWORD. "
+                 "Hãy đặt mật khẩu quản lý trong Streamlit Secrets trước khi gửi email.")
+        st.stop()
     if not password:
         st.warning("**Chế độ chưa bảo vệ:** Chưa thiết lập `APP_PASSWORD`. Không nhập dữ liệu cá nhân thật và KHÔNG công khai ứng dụng này trước khi đặt mật khẩu. SQLite trên máy chủ cloud có thể mất khi khởi động lại.")
         return
@@ -1334,7 +1446,7 @@ def screen_billing(st,period,db_path):
                 address=selected_inv["snapshot"].get("email","")
                 st.info("Chưa có dịch vụ email: tải PDF rồi đính kèm thủ công vào Gmail.")
                 st.code(f'Đến: {address or "[EMAIL KHÁCH]"}\nChủ đề: Thông báo tiền phòng {selected_inv["snapshot"]["room_code"]} - {period_label(period)}',language="text")
-            with st.expander("Gửi email hàng loạt (cần SMTP hoặc Resend API)"):
+            with st.expander("Gửi email hàng loạt (Gmail API / nhà cung cấp đã kết nối)"):
                 possible=[i for i in current if email_valid(i["snapshot"].get("email",""))]
                 email_all=st.checkbox("Chọn tất cả phòng có email hợp lệ",key="email_all_rooms")
                 selected_invs=possible if email_all else st.multiselect("Chọn thông báo",possible,format_func=_invoice_title)
@@ -1472,7 +1584,7 @@ def screen_settings(st,period,db_path):
             holder=st.text_input("Chủ tài khoản",cfg["bank_holder"])
             account=st.text_input("Số tài khoản",cfg["bank_account"])
             due_day=st.number_input("Ngày đến hạn (tháng kế tiếp)",min_value=1,max_value=28,value=int(cfg["due_day"]))
-            auto_email=st.checkbox("Tự gửi email khi chốt tiền (cần SMTP hoặc Resend API)",value=cfg.get("auto_email")=="1")
+            auto_email=st.checkbox("Tự gửi email khi chốt tiền (cần dịch vụ email đã kết nối)",value=cfg.get("auto_email")=="1")
         if st.form_submit_button("Lưu cài đặt",type="primary"):
             try:settings_save({"property_name":name,"property_address":address,"property_phone":phone,
                   "electric_rate":str(e_rate),"water_rate":str(w_rate),"bank_name":bank,
@@ -1495,8 +1607,24 @@ def screen_settings(st,period,db_path):
     smtp=smtp_config(_secrets())
     st.write("**Dịch vụ gửi email:**", email_provider(smtp))
     st.caption("Trạng thái có cấu hình không có nghĩa đã gửi thành công. Hãy thử nghiệm với email của mình.")
-    if st.button("Kiểm tra kết nối SMTP (không gửi email)", key="smtp_check"):
-        st.info(smtp_diagnostic(smtp))
+    if email_provider(smtp).startswith("Gmail API"):
+        st.success("Đã có cấu hình Gmail API. Kiểm tra gửi thực tế bằng nút bên dưới.")
+        st.info("Gmail API sử dụng OAuth 2.0 qua HTTPS, không cần SMTP và không cần Resend. "
+                "Đây là quyền gửi bằng GMAIL_SENDER, không phải đăng nhập Google cho mọi khách thuê.")
+        gmail_to = st.text_input("Email nhận kiểm tra (nên nhập Gmail của bạn)",
+                                 value=smtp.get("GMAIL_SENDER", ""), key="gmail_test_address")
+        test_ok = st.checkbox("Tôi đồng ý gửi một email thử nghiệm KHÔNG có PDF, không có dữ liệu khách thuê",
+                              key="gmail_test_confirm")
+        if st.button("Gửi thử qua Gmail API", key="gmail_test_send", disabled=not test_ok):
+            try:
+                st.success(gmail_test_email(smtp, gmail_to))
+            except Exception as ex:
+                st.error(str(ex))
+        st.caption("Để gửi cho khách thật, mở Thu tiền > chọn thông báo hợp lệ > Gửi PDF đến email khách. "
+                   "Chứng từ phát sinh bất thường vẫn bị chặn gửi để tránh gửi nhầm.")
+    if email_provider(smtp) == "SMTP":
+        if st.button("Kiểm tra kết nối SMTP (không gửi email)", key="smtp_check"):
+            st.info(smtp_diagnostic(smtp))
     if email_provider(smtp).startswith("Resend"):
         if _resend_sender_is_testing(smtp):
             st.warning("Resend đang ở chế độ THỬ NGHIỆM (onboarding@resend.dev). "
@@ -1512,9 +1640,12 @@ def screen_settings(st,period,db_path):
                 st.error(str(ex))
         st.caption("Tra cứu lỗi chi tiết: Resend > Logs > lọc mã 403. "
                    "Không đăng ảnh có API Key hoặc nội dung Secrets.")
-    st.caption("Nếu SMTP tiếp tục bị ngắt kết nối trên Streamlit Cloud, "
-               "có thể dùng Resend qua HTTPS: thêm RESEND_API_KEY và RESEND_FROM vào Secrets. "
-               "Để gửi khách thật, cần xác minh tên miền tại Resend. Mật khẩu Gmail không dùng cho Resend.")
+    st.caption("Gmail API (OAuth 2.0) được ưu tiên nếu cấu hình đủ bốn biến GMAIL_*. "
+               "Lưu Client Secret và Refresh Token trong Streamlit Secrets, không đưa lên GitHub.")
+    if not email_provider(smtp).startswith("Gmail API"):
+        st.caption("Nếu SMTP bị ngắt kết nối trên Streamlit Cloud, "
+                   "có thể dùng Gmail API OAuth thay thế mà không cần mua tên miền. "
+                   "Resend yêu cầu tên miền đã xác minh khi gửi khách thật.")
     st.write("**Supabase / đa tài khoản:** Chưa kết nối")
     st.write("**Google Login:** Chưa kết nối")
     st.write("**Google Sheets:** Chưa kết nối")
